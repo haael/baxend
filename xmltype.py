@@ -34,7 +34,13 @@ class XMLType:
 			else:
 				self.xml = xml
 		else:
-			self.xml = Element(default_tag)
+			try:
+				pfx, lname = default_tag.split(':')
+			except TypeError:
+				pfx = ''
+				lname = default_tag
+			ns = self.xmlns[pfx]
+			self.xml = Element(f'{{{ns}}}{lname}')
 		self.xml_attribute = {}
 		self.xml_element_type = {}
 		self.xml_tag = default_tag
@@ -51,7 +57,15 @@ class XMLType:
 			return super().__getattribute__(py_attr)
 		else:
 			try:
-				return convert(self.xml.attrib[xml_attr]) if convert != None else self.xml.attrib[xml_attr]
+				pfx, lname = xml_attr.split(':')
+			except TypeError:
+				et_attr = xml_attr
+			else:
+				ns = self.xmlns[pfx]
+				et_attr = f'{{{ns}}}{lname}'
+			
+			try:
+				return convert(self.xml.attrib[et_attr]) if convert != None else self.xml.attrib[et_attr]
 			except KeyError:
 				raise AttributeError
 	
@@ -68,9 +82,14 @@ class XMLType:
 			super().__setattr__(py_attr, value)
 		else:
 			try:
-				self.xml.attrib[xml_attr] = convert(value) if convert != None else value
-			except KeyError:
-				raise AttributeError
+				pfx, lname = xml_attr.split(':')
+			except TypeError:
+				et_attr = xml_attr
+			else:
+				ns = self.xmlns[pfx]
+				et_attr = f'{{{ns}}}{lname}'
+			
+			self.xml.attrib[et_attr] = convert(value) if convert != None else value
 	
 	def __delattr__(self, py_attr):
 		"Delete XML attribute from the element (if registered)."
@@ -85,7 +104,15 @@ class XMLType:
 			super().__delattr__(py_attr)
 		else:
 			try:
-				del self.xml.attrib[xml_attr]
+				pfx, lname = xml_attr.split(':')
+			except TypeError:
+				et_attr = xml_attr
+			else:
+				ns = self.xmlns[pfx]
+				et_attr = f'{{{ns}}}{lname}'
+			
+			try:
+				del self.xml.attrib[et_attr]
 			except KeyError:
 				raise AttributeError
 	
@@ -106,7 +133,20 @@ class XMLType:
 			result = []
 			for item in xml_element:
 				try:
-					xml_element_type = self.xml_element_type[item.tag]
+					if item.tag[0] == '{':
+						ns, lname = item.tag.split('}')
+						ns = ns[1:]
+						for x_pfx, n_ns in self.xmlns.items():
+							if n_ns == ns:
+								pfx = x_pfx
+								break
+						else:
+							raise ValueError(f"Prefix not found for namespace `{ns}`. Add it to the `XMLType.xmlns` dictionary.")
+					else:
+						pfx = ''
+						lname = item.tag
+					
+					xml_element_type = self.xml_element_type[f'{pfx}{lname}']
 				except KeyError:
 					xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
 				result.append(xml_element_type(xml=item))
@@ -382,9 +422,11 @@ if __debug__ and __name__ == '__main__':
 	
 	XMLType.xmlns['baxend'] = 'https://github.com/haael/baxend'
 	
-	root = XMLType(root_xml, 'root')
-	fourth = XMLType(fourth_xml, 'one')
+	root = XMLType(root_xml, 'baxend:root')
+	fourth = XMLType(fourth_xml, 'baxend:one')
 	root += fourth
+	fifth = XMLType(None, 'baxend:one')
+	root += fifth
 	
 	xmlns = {'':'https://github.com/haael/baxend', 'baxend':None}
 	
