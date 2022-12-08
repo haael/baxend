@@ -36,7 +36,7 @@ class XMLType:
 		else:
 			try:
 				pfx, lname = default_tag.split(':')
-			except TypeError:
+			except ValueError:
 				pfx = ''
 				lname = default_tag
 			ns = self.xmlns[pfx]
@@ -58,7 +58,7 @@ class XMLType:
 		else:
 			try:
 				pfx, lname = xml_attr.split(':')
-			except TypeError:
+			except ValueError:
 				et_attr = xml_attr
 			else:
 				ns = self.xmlns[pfx]
@@ -83,7 +83,7 @@ class XMLType:
 		else:
 			try:
 				pfx, lname = xml_attr.split(':')
-			except TypeError:
+			except ValueError:
 				et_attr = xml_attr
 			else:
 				ns = self.xmlns[pfx]
@@ -105,7 +105,7 @@ class XMLType:
 		else:
 			try:
 				pfx, lname = xml_attr.split(':')
-			except TypeError:
+			except ValueError:
 				et_attr = xml_attr
 			else:
 				ns = self.xmlns[pfx]
@@ -136,15 +136,19 @@ class XMLType:
 					if item.tag[0] == '{':
 						ns, lname = item.tag.split('}')
 						ns = ns[1:]
-						for x_pfx, n_ns in self.xmlns.items():
-							if n_ns == ns:
-								pfx = x_pfx
-								break
-						else:
-							raise ValueError(f"Prefix not found for namespace `{ns}`. Add it to the `XMLType.xmlns` dictionary.")
 					else:
-						pfx = ''
+						ns = ''
 						lname = item.tag
+					
+					for x_pfx, n_ns in self.xmlns.items():
+						if n_ns == ns:
+							if x_pfx:
+								pfx = x_pfx + ':'
+							else:
+								pfx = ''
+							break
+					else:
+						raise ValueError(f"Prefix not found for namespace `{ns}`. Add it to the `XMLType.xmlns` dictionary.")
 					
 					xml_element_type = self.xml_element_type[f'{pfx}{lname}']
 				except KeyError:
