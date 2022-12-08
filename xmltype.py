@@ -221,30 +221,18 @@ class XMLType:
 		return self
 	
 	def __bytes__(self):
-		result = canonicalize(tostring(self.xml, 'utf-8'))
-		#result = canonicalize("".join(self.lines()))
-		if isinstance(result, bytes):
-			return result
-		else:
-			return result.encode('utf-8')
+		return str(self).encode('utf-8')
 	
 	def __str__(self):
-		result = canonicalize(tostring(self.xml, 'utf-8'))
-		#result = canonicalize("".join(self.lines()))
-		if isinstance(result, str):
-			return result
-		else:
-			return result.decode('utf-8')
+		return canonicalize('\n'.join(self.lines()))
 	
 	def __hash__(self):
-		return hash(canonicalize(tostring(self.xml, 'utf-8')))
-		#return hash(canonicalize("".join(self.lines())))
+		return hash(str(self))
 	
 	def __eq__(self, other):
-		try:
-			return canonicalize(tostring(self.xml, 'utf-8')) == canonicalize(tostring(other.xml, 'utf-8'))
-			#return canonicalize("".join(self.lines())) == canonicalize("".join(other.lines()))
-		except AttributeError:
+		if hasattr(self, 'xml') and hasattr(other, 'xml'):
+			return str(self) == str(other)
+		else:
 			return NotImplemented
 	
 	def lines(self, indent=0, context_ns=None, preserve_whitespace=False, xmlns={}, include_xmlns=True):
