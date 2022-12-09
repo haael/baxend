@@ -150,14 +150,32 @@ class XMLType:
 					else:
 						raise ValueError(f"Prefix not found for namespace `{ns}`. Add it to the `XMLType.xmlns` dictionary.")
 					
-					xml_element_type = self.xml_element_type[f'{pfx}{lname}']
+					xml_element_type = self.xml_element_type[pfx + lname]
 				except KeyError:
 					xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
 				result.append(xml_element_type(xml=item))
 			return result
 		else:
+			tagname = xml_element.tag
+			if tagname[0] == '{':
+				ns, lname = tagname.split('}')
+				ns = ns[1:]
+			else:
+				ns = ''
+				lname = tagname
+			
+			for x_pfx, x_ns in self.xmlns.items():
+				if x_ns == ns:
+					if x_pfx:
+						pfx = x_pfx + ':'
+					else:
+						pfx = ''
+					break
+			else:
+				raise ValueError(f"Prefix not found for namespace `{ns}`. Add it to the `XMLType.xmlns` dictionary.")
+			
 			try:
-				xml_element_type = self.xml_element_type[xml_element.tag]
+				xml_element_type = self.xml_element_type[pfx + lname]
 			except KeyError:
 				xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
 			return xml_element_type(xml=xml_element)
@@ -255,8 +273,12 @@ class XMLType:
 		
 		pfx = ''
 		if ns != None:
+			nopfx = set()
 			for x_pfx, x_ns in chain(xmlns.items(), self.xmlns.items()):
-				if x_ns == None: continue
+				if x_pfx in nopfx: continue
+				if x_ns == None:
+					nopfx.add(x_pfx)
+					continue
 				if x_ns == ns:
 					if x_pfx:
 						pfx = x_pfx + ':'
@@ -413,14 +435,17 @@ if __debug__ and __name__ == '__main__':
 	'''
 	
 	XMLType.xmlns['baxend'] = 'https://github.com/haael/baxend'
+	XMLType.xmlns['other'] = 'other'
 	
 	root = XMLType(root_xml, 'baxend:root')
+	print(root.xml_tag)
 	fourth = XMLType(fourth_xml, 'baxend:one')
 	root += fourth
 	fifth = XMLType(None, 'baxend:one')
 	root += fifth
+	print(fifth.xml_tag)
 	
-	xmlns = {'':'https://github.com/haael/baxend', 'baxend':None}
+	xmlns = {'':'https://github.com/haael/baxend', 'baxend':None, 'other':None}
 	
 	print()
 	for line in root.lines(xmlns=xmlns):
