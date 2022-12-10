@@ -30,7 +30,7 @@ class XMLType:
 	def __init__(self, xml, default_tag):
 		if xml != None:
 			if isinstance(xml, str):
-				self.xml = fromstring(xml)
+				self.xml = fromstring(xml.strip())
 			else:
 				self.xml = xml
 		else:
