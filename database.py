@@ -15,11 +15,16 @@ if __name__ == '__main__':
 __all__ = 'Database', 'Table'
 
 
-from basex import Session as BaseXSession, BaseXQueryError
-from locking import locked_ro, locked_rw, MultiLock, Driver, Accessor
 from collections import defaultdict
 from itertools import chain
 from enum import Enum
+
+if __name__ == '__main__':
+	from basex import Session as BaseXSession, BaseXQueryError
+	from locking import locked_ro, locked_rw, MultiLock, Driver, Accessor
+else:
+	from .basex import Session as BaseXSession, BaseXQueryError
+	from .locking import locked_ro, locked_rw, MultiLock, Driver, Accessor
 
 
 class Database(BaseXSession, Driver):
@@ -173,21 +178,6 @@ class Table(Accessor):
 		
 		return self.__class__(self.database, documents, expr_chain, (), self.xmlns)
 	
-	def __getitem__(self, keys_values):
-		if keys_values == Ellipsis:
-			pass
-		elif not isinstance(keys_values, tuple):
-			keys_values = keys_values,
-		else:
-			keys_values = tuple(keys_values)
-		# TODO: type checks
-		
-		if len(self.selector_chain) > len(self.expression_chain):
-			raise TypeError("End of chain reached.")
-		
-		sel_chain = self.selector_chain + (keys_values,)
-		return self.__class__(self.database, self.document, self.expression_chain, sel_chain, self.xmlns)
-	
 	def __xmlns_decls(self):
 		for prefix, namespace in self.xmlns.items():
 			if prefix == '':
@@ -215,14 +205,12 @@ class Table(Accessor):
 	__numerals = 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'
 	__digits = '1234567890'
 	
-	def __query_expr(self, selector=None, level=''):
+	def __query_expr(self, modifier=None, level=''):
 		p = f'doc("{self.database.database_name}/{self.document}")'
 		s = ''
 		l = 0
-		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain if selector == None else chain(self.selector_chain, [None]))):
-			if vals == None:
-				keyspec = selector
-			elif isinstance(vals, tuple):
+		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain)):
+			if isinstance(vals, tuple):
 				keyspecs = []
 				for n, (key, val) in enumerate(zip(keys, vals)):
 					if not isinstance(val, slice):
@@ -245,7 +233,7 @@ class Table(Accessor):
 				
 				sp = []
 				for k, subpath in enumerate(path):
-					sp.append(f'let ${self.__numerals[k]}{level} :=\n{subpath.__query_expr(selector="", level=self.__digits[k] + level)}\n')
+					sp.append(f'let ${self.__numerals[k]}{level} :=\n{subpath.__query_expr(modifier=None, level=self.__digits[k] + level)}\n')
 				
 				for k in range(len(path)):
 					sp.append(f'{("let $this :=" + chr(10) + "for" if k == 0 else "   ")} ${self.__numerals[k]} in ${self.__numerals[k]}{level}{("," if k != len(path) - 1 else "")}\n')
@@ -253,7 +241,8 @@ class Table(Accessor):
 				if filter_:
 					sp.append(f' where {filter_}\n')
 				
-				sp.append(f' return <tuple xmlns="https://github.com/haael/baxend">{("".join(f"{{${self.__numerals[_k]}}}" for _k in range(len(path))))}</tuple>\n')
+				ts = "".join(f"{{${self.__numerals[_k]}}}" for _k in range(len(path)))
+				sp.append(f' return <tuple xmlns="https://github.com/haael/baxend">{ts}</tuple>\n')
 				
 				s = ''.join(sp)
 				p = f'$this{keyspec}'
@@ -264,12 +253,15 @@ class Table(Accessor):
 				p = f'$this{keyspec}'
 				l += 1
 		
+		if modifier:
+			p = modifier(p)
+		
 		if s:
 			return f'{s}{" "*l}return {p}'
 		else:
 			return p
 	
-	__Mode = Enum('Table._Table__Mode', 'GETITEM KEYS')
+	__Mode = Enum('Table._Table__Mode', 'GET COUNT INSERT DELETE KEYS')
 	
 	def __query_string(self, mode):
 		try:
@@ -277,15 +269,21 @@ class Table(Accessor):
 		except KeyError:
 			pass
 		
-		if mode == self.__Mode.GETITEM:
-			selector = None
+		if mode == self.__Mode.GET:
+			modifier = None
+		elif mode == self.__Mode.COUNT:
+			modifier = lambda p: f'count({p})'
 		elif mode == self.__Mode.KEYS:
-			keys = self.expression_chain[len(self.selector_chain)][1]
-			selector = '/(' + ','.join(keys) + ')'
+			keys = ', '.join(self.expression_chain[len(self.selector_chain) - 1][1])
+			modifier = lambda p: f'{p}/({keys})'
+		elif mode == self.__Mode.DELETE:
+			modifier = lambda p: f'{p}/(delete node ., update:output("deleted"))'
+		elif mode == self.__Mode.INSERT:
+			modifier = lambda p: f'insert node $inserted into {p}'
 		else:
 			raise NotImplementedError(f"Unsupported mode: {mode}.")
 		
-		result = '\n'.join(chain(self.__xmlns_decls(), self.__var_decls(), [self.__query_expr(selector)]))
+		result = '\n'.join(chain(self.__xmlns_decls(), self.__var_decls(), (['declare variable $inserted external;'] if mode == self.__Mode.INSERT else []) + [self.__query_expr(modifier)]))
 		self.__query_string_cache[mode] = result
 		return result
 	
@@ -309,34 +307,83 @@ class Table(Accessor):
 			for k, subpath in enumerate(self.expression_chain[0][0]):
 				subpath.__apply_keys(query, level=self.__digits[k] + level)
 	
+	def __apply_value(self, query, value):
+		query.bind('$inserted', value, 'element()')
+	
+	def __is_slice(self):
+		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain)):
+			if isinstance(vals, tuple):
+				for n, (key, val) in enumerate(zip(keys, vals)):
+					if isinstance(val, slice):
+						return True
+			elif vals == Ellipsis:
+				return True
+			else:
+				raise RuntimeError
+		
+		if self.expression_chain and isinstance(self.expression_chain[0][0], tuple):
+			for subpath in self.expression_chain[0][0]:
+				if subpath.__is_slice():
+					return True
+		
+		return False
+	
+	def __getitem__(self, keys_values):
+		if keys_values == Ellipsis:
+			pass
+		elif not isinstance(keys_values, tuple):
+			keys_values = keys_values,
+		else:
+			keys_values = tuple(keys_values)
+		# TODO: type checks
+		
+		if len(self.selector_chain) > len(self.expression_chain):
+			raise TypeError("End of chain reached.")
+		
+		sel_chain = self.selector_chain + (keys_values,)
+		return self.__class__(self.database, self.document, self.expression_chain, sel_chain, self.xmlns)
+	
 	@locked_ro
 	def __str__(self):
-		query_str = self.__query_string(self.__Mode.GETITEM)		
+		query_str = self.__query_string(self.__Mode.GET)
 		query = self.database.queries[query_str]
 		self.__apply_keys(query)
-		return query.execute()
+		result = query.execute()
+		if not result and not self.__is_slice():
+			raise KeyError("Query returned no result.")
+		return result
 	
 	@locked_ro
 	def __iter__(self):
-		query_str = self.__query_string(self.__Mode.GETITEM)		
+		query_str = self.__query_string(self.__Mode.GET)		
 		query = self.database.queries[query_str]
 		self.__apply_keys(query)
 		for typeid, item in query.results():
 			yield item
 	
+	@locked_ro
 	def __len__(self):
-		return len(list(self.keys()))
+		query_str = self.__query_string(self.__Mode.COUNT)
+		query = self.database.queries[query_str]
+		self.__apply_keys(query)
+		return sum(int(_l) for _l in query.execute().split('\n'))
 	
-	def __contains__(self, key_values):
-		return key_values in frozenset(self.keys())
+	@locked_ro
+	def __contains__(self, keys_values):
+		final = self[keys_values]
+		query_str = final.__query_string(self.__Mode.COUNT)
+		query = final.database.queries[query_str]
+		final.__apply_keys(query)
+		return bool(sum(int(_l) for _l in query.execute().split('\n')))
 	
 	@locked_ro
 	def keys(self):
 		r = []
 		l = len(self.expression_chain[len(self.selector_chain)][1])
-		query_str = self.__query_string(self.__Mode.KEYS)
-		query = self.database.queries[query_str]
-		self.__apply_keys(query)
+		final = self[...]
+		query_str = final.__query_string(self.__Mode.KEYS)
+		query = final.database.queries[query_str]
+		final.__apply_keys(query)
 		for typeid, item in query.results():
 			if typeid == 'attribute()':
 				item = item.split('=')[1][1:-1]
@@ -357,21 +404,38 @@ class Table(Accessor):
 		for key in list(self.keys()):
 			yield key, self[key]
 	
-	@locked_rw
 	def clear(self):
-		raise NotImplementedError
+		del self[...]
 	
 	@locked_rw
-	def update(self, values):
-		raise NotImplementedError
+	def __setitem__(self, keys_values, values):
+		final = self[keys_values]
+		query_str = final.__query_string(self.__Mode.DELETE)
+		query = final.database.queries[query_str]
+		final.__apply_keys(query)
+		query.execute()
+		
+		query_str = self.__query_string(self.__Mode.INSERT)
+		query = self.database.queries[query_str]
+		if self.__is_slice():
+			for value in values:
+				self.__apply_keys(query)
+				self.__apply_value(query, value)
+				query.execute()
+		else:
+			self.__apply_keys(query)
+			self.__apply_value(query, values)
+			query.execute()
 	
 	@locked_rw
-	def __setitem__(self, key_values, values):
-		raise NotImplementedError
-	
-	@locked_rw
-	def __delitem__(self, key_values):
-		raise NotImplementedError
+	def __delitem__(self, keys_values):
+		final = self[keys_values]
+		query_str = final.__query_string(self.__Mode.DELETE)
+		query = final.database.queries[query_str]
+		final.__apply_keys(query)
+		result = query.execute() # TODO: check result
+		if not result and not self.__is_slice():
+			raise KeyError("Query returned no result.")
 
 
 if __debug__ and __name__ == '__main__':
@@ -456,8 +520,8 @@ if __debug__ and __name__ == '__main__':
 		try:
 			print()
 			print(1)
-			print(list(table1.keys()))
-			print(list(table1["First"].keys()))
+			print("table1.keys():", list(table1.keys()))
+			print("table1[\"First\"].keys():", list(table1["First"].keys()))
 			print(table1["First"]['1', '2'])
 			print("len:", len(table1["First"]))
 			for value in table1["First"][...]:
@@ -478,7 +542,7 @@ if __debug__ and __name__ == '__main__':
 			
 			tb = get_time()
 			for n in range(perf_iters):
-				x = str(table2["Fifth"][20, 50])
+				x = list(table2["Fifth"][20, 50])
 			te = get_time()
 			print("amortized time:", int((te - tb) / 10**6) / perf_iters, "ms")
 		except BaseXQueryError as error:
@@ -499,6 +563,47 @@ if __debug__ and __name__ == '__main__':
 			print("amortized time:", int((te - tb) / 10**6) / perf_iters, "ms")
 		except BaseXQueryError as error:
 			print(error)
+		
+		
+		print("1?:", "First" in table1)
+		print("2?:", "Second" in table1)
+		print("3?:", "Third" in table1)
+		try:
+			print("3:", table1["Third"])
+		except KeyError:
+			print("Third not found (correct).")
+		
+		try:
+			print(database['one.xml'])
+			print()
+			
+			print('table1["First"].clear()')
+			table1["First"].clear()
+			print(database['one.xml'])
+			print()
+			
+			print('del table1["Second"][10,30]')
+			del table1["Second"][10,30]
+			print(database['one.xml'])
+			print()
+			
+			print('del table1["Second"][...]')
+			del table1["Second"][...]
+			print(database['one.xml'])
+			print()
+			
+			print('del table1["Second"]')
+			del table1["Second"]
+			print(database['one.xml'])
+			print()
+			
+			print('table1["First"][\'11\', \'31\'] = \'<two x="11" y="31">newly</two>\'')
+			table1["First"]['11', '31'] = '<two x="11" y="31">newly</two>'
+			print(database['one.xml'])
+			print()
+		except BaseXQueryError as error:
+			print(error)
+		
 		
 		del database['one.xml']
 		del database['two.xml']

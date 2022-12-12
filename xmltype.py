@@ -15,7 +15,7 @@ if __name__ == '__main__':
 __all__ = 'XMLType',
 
 
-from xml.etree.ElementTree import ElementTree, Element, tostring, canonicalize
+from xml.etree.ElementTree import ElementTree, Element, tostring, canonicalize, ParseError
 from defusedxml.ElementTree import fromstring
 from itertools import chain
 
@@ -30,7 +30,12 @@ class XMLType:
 	def __init__(self, xml, default_tag):
 		if xml != None:
 			if isinstance(xml, str):
-				self.xml = fromstring(xml.strip())
+				try:
+					self.xml = fromstring(xml.strip())
+				except ParseError as error:
+					log.error(f"Error while parsing XML text into document: {error}")
+					log.debug("\n" + xml.strip())
+					raise
 			else:
 				self.xml = xml
 		else:
@@ -117,12 +122,46 @@ class XMLType:
 				raise AttributeError
 	
 	def __getitem__(self, index):
-		"Return child element with the right type (as registered). If numeric index is provided, return the child of that number. If a slice is provided, return a list of matching elements. If a string is provided, return the child with matching xml:id."
-		
 		if isinstance(index, str):
-			xml_element = self.xml.find(f'.//*[@xml:id="{index}"]', namespaces=self.xmlns)
-			if xml_element == None:
-				raise KeyError(f"Element with id \"{index}\" not found.")
+			if index[0] == '#':
+				id_val = index[1:]
+				xml_element = self.xml.find(f'.//*[@xml:id="{id_val}"]', namespaces=self.xmlns)
+				if xml_element == None:
+					raise KeyError(f"Element with id \"{id_val}\" not found.")
+			
+			elif index[0] == '@':
+				if ':' in index:
+					pfx, lname = index[1:].split(':')
+					ns = self.xmlns[pfx]
+					attr = f'{{{ns}}}{lname}'
+				else:
+					attr = index[1:]
+				
+				try:
+					return self.xml.attrib[attr]
+				except KeyError:
+					raise KeyError(f"Attribute \"{attr}\" not found.")
+			
+			else:
+				if ':' in index:
+					pfx, lname = index.split(':')
+				else:
+					lname = index
+					pfx = ''
+				
+				try:
+					ns = self.xmlns[pfx]
+				except KeyError:
+					raise ValueError(f"Namespace prefix not found: \"{pfx}\"")
+				
+				if ns:
+					tagname = f'{{{ns}}}{lname}'
+				else:
+					tagname = lname
+				
+				xml_element = self.xml.find(f'./{tagname}', namespaces=self.xmlns)
+				if xml_element == None:
+					raise KeyError(f"Element {tagname} not found.")
 		else:
 			try:
 				xml_element = self.xml[index]
@@ -152,7 +191,10 @@ class XMLType:
 					
 					xml_element_type = self.xml_element_type[pfx + lname]
 				except KeyError:
-					xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
+					try:
+						xml_element_type = self.xml_element_type['*']
+					except KeyError:
+						xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
 				result.append(xml_element_type(xml=item))
 			return result
 		else:
@@ -177,7 +219,10 @@ class XMLType:
 			try:
 				xml_element_type = self.xml_element_type[pfx + lname]
 			except KeyError:
-				xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
+				try:
+					xml_element_type = self.xml_element_type['*']
+				except KeyError:
+					xml_element_type = lambda xml: XMLType(xml=xml, default_tag=None)
 			return xml_element_type(xml=xml_element)
 	
 	def __setitem__(self, index, element):
@@ -242,7 +287,12 @@ class XMLType:
 		return str(self).encode('utf-8')
 	
 	def __str__(self):
-		return canonicalize('\n'.join(self.lines()))
+		try:
+			return canonicalize('\n'.join(self.lines()))
+		except ParseError as error:
+			log.error(f"Error while rendering XML document into text: {error}")
+			log.debug("\n" + '\n'.join(self.lines()))
+			raise
 	
 	def __hash__(self):
 		return hash(str(self))
@@ -252,6 +302,13 @@ class XMLType:
 			return str(self) == str(other)
 		else:
 			return NotImplemented
+	
+	@staticmethod
+	def __escape(text):
+		text = text.replace('&', '&amp;')
+		text = text.replace('<', '&lt;')
+		text = text.replace('>', '&gt;')
+		return text
 	
 	def lines(self, indent=0, context_ns=None, preserve_whitespace=False, xmlns={}, include_xmlns=True):
 		"Yield lines of the XML tree one by one. Honours `xml:space`."
@@ -288,7 +345,7 @@ class XMLType:
 		attr_list = []
 		
 		if ns != None:
-			attr_list.append(f' xmlns="{ns}"')
+			attr_list.append(f' xmlns="{self.__escape(ns)}"')
 			xmlns = xmlns.copy()
 			xmlns[''] = ns
 		
@@ -300,9 +357,9 @@ class XMLType:
 				if x_pfx.startswith('xml'): continue
 				if x_ns == None: continue
 				if x_pfx:
-					attr_list.append(f' xmlns:{x_pfx}="{x_ns}"')
+					attr_list.append(f' xmlns:{x_pfx}="{self.__escape(x_ns)}"')
 				elif ns == None:
-					attr_list.append(f' xmlns="{x_ns}"')
+					attr_list.append(f' xmlns="{self.__escape(x_ns)}"')
 		
 		for attr_name in sorted(self.xml.attrib.keys()):
 			attr_value = self.xml.attrib[attr_name]
@@ -325,7 +382,7 @@ class XMLType:
 				attr_pfx = ''
 				attr_lname = attr_name
 			
-			attr_list.append(f' {attr_pfx}{attr_lname}="{attr_value}"')
+			attr_list.append(f' {attr_pfx}{attr_lname}="{self.__escape(attr_value)}"')
 		
 		attrs = ''.join(attr_list)
 		
@@ -336,7 +393,7 @@ class XMLType:
 				yield f'{spaces}<{pfx}{tag}{attrs}/>'
 		
 		elif not len(self) and preserve_whitespace:
-			yield f'{spaces}<{pfx}{tag}{attrs}>{self.xml.text}</{pfx}{tag}>'
+			yield f'{spaces}<{pfx}{tag}{attrs}>{self.__escape(self.xml.text)}</{pfx}{tag}>'
 		
 		elif preserve_whitespace: # FIXME
 			
@@ -344,11 +401,12 @@ class XMLType:
 			if self.xml.text:
 				lines = self.xml.text.split('\n')
 				if len(lines) > 1:
-					yield opening + lines[0]
-					yield from lines[1:-1]
-					prev = lines[-1]
+					yield opening + self.__escape(lines[0])
+					for line in lines[1:-1]:
+						yield self.__escape(line)
+					prev = self.__escape(lines[-1])
 				else:
-					prev = opening + lines[0]
+					prev = opening + self.__escape(lines[0])
 			else:
 				prev = opening
 			
@@ -367,11 +425,12 @@ class XMLType:
 				if child.xml.tail:
 					lines = child.xml.tail.split('\n')
 					if len(lines) > 1:
-						yield nxt + lines[0]
-						yield from lines[1:-1]
-						prev = lines[-1]
+						yield nxt + self.__escape(lines[0])
+						for line in lines[1:-1]:
+							yield self.__escape(line)
+						prev = self.__escape(lines[-1])
 					else:
-						prev = nxt + lines[0]
+						prev = nxt + self.__escape(lines[0])
 				else:
 					prev = nxt
 				nxt = None
@@ -379,11 +438,12 @@ class XMLType:
 			if self.xml.tail:
 				lines = self.xml.tail.split('\n')
 				if len(lines) > 1:
-					yield prev + lines[0]
-					yield from lines[1:-1]
-					prev = lines[-1]
+					yield prev + self.__escape(lines[0])
+					for line in lines[1:-1]:
+						yield self.__escape(line)
+					prev = self.__escape(lines[-1])
 				else:
-					prev = prev + lines[0]
+					prev = prev + self.__escape(lines[0])
 			
 			closing = f'</{pfx}{tag}>'
 			yield prev + closing
@@ -392,11 +452,11 @@ class XMLType:
 			yield f'{spaces}<{pfx}{tag}{attrs}>'
 
 			if self.xml.text and self.xml.text.strip():
-				yield spaces + " " + self.xml.text.strip()
+				yield spaces + " " + self.__escape(self.xml.text.strip())
 			for child in self:
 				yield from child.lines(indent + 1, ns if (ns != None and context_ns != Ellipsis) else context_ns, False, xmlns, False)
 				if child.xml.tail and child.xml.tail.strip():
-					yield spaces + " " + child.xml.tail.strip()
+					yield spaces + " " + self.__escape(child.xml.tail.strip())
 
 			yield f'{spaces}</{pfx}{tag}>'
 
@@ -409,7 +469,7 @@ if __debug__ and __name__ == '__main__':
 
 
 				<c:two xmlns:c="other" b="2">B</c:two>
-				<b:two b="3">C</b:two>
+				<b:two b="3">C &amp; C</b:two>
 			</b:one>
 			<b:one xml:id="first" a="2" xml:space="preserve">
 				<b:two b="1">D</b:two>
@@ -463,21 +523,32 @@ if __debug__ and __name__ == '__main__':
 	print("----")
 
 	print()
-	for line in root['first'].lines(xmlns=xmlns):
+	for line in root['#first'].lines(xmlns=xmlns):
 		print(line)
 	print("----")
 
 	print()
-	for line in root['second'].lines(xmlns=xmlns):
+	for line in root['#second'].lines(xmlns=xmlns):
 		print(line)
 	print("----")
 
 	print()
-	for line in root['third'].lines(indent=1, xmlns=xmlns):
+	for line in root['#third'].lines(indent=1, xmlns=xmlns):
 		print(line)
 	print("----")
 	
 	print()
-	for line in root['fourth'].lines(xmlns=xmlns):
+	for line in root['#fourth'].lines(xmlns=xmlns):
 		print(line)
 	print("----")
+	
+	print()
+	for line in root['baxend:one'].lines(xmlns=xmlns):
+		print(line)
+	print("----")
+	
+	print(root['baxend:one']['@a'])
+	
+	print(root[0][2].xml.text)
+
+
