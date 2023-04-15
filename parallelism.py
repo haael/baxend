@@ -38,13 +38,13 @@ class BackgroundTask:
 		self.process.start()
 	
 	def __producer(self):
+		result = None
 		try:
 			result = self.runnable(*self.args, **self.kwargs)
 		except Exception as error:
-			log.error(f"Error in background task: {repr(error)}")
+			log.error(f"Error in background task: {type(error)}")
 			log.error(str(error))
-			result = None
-			raise
+			result = error
 		finally:
 			self.queue.put(result)
 			self.queue.close()
@@ -61,7 +61,12 @@ class BackgroundTask:
 
 
 def parallel(*runnables):
-	return list(_runnable() for _runnable in runnables)
+	results = list(_runnable() for _runnable in runnables)
+	errors = [_error for _error in results if isinstance(_error, Exception)]
+	if errors:
+		raise ExceptionGroup("Errors in `parallel`.", errors)
+	else:
+		return results
 
 
 def task_fg(old_generator):
@@ -90,24 +95,29 @@ class ForegroundTask:
 					break
 				self.queue.put(item)
 		except Exception as error:
-			log.error(f"Error in foreground task: {repr(error)}")
+			log.error(f"Error in foreground task: {type(error)}")
 			log.error(str(error))
-			raise
+			self.queue.put(error)
 		finally:
 			self.queue.put(self.Sentinel.END)
 			self.queue.close()
 	
 	def __iter__(self):
 		item = self.Sentinel.BEGIN
+		error = None
 		while item != self.Sentinel.END:
 			try:
 				item = self.queue.get()
 			except ValueError:
 				break
 			else:
-				if item != self.Sentinel.END:
+				if isinstance(item, Exception):
+					error = item
+				elif item != self.Sentinel.END:
 					yield item
 		self.process.join()
+		if error != None:
+			raise error
 	
 	def kill(self):
 		self.exit_event.set()
@@ -121,6 +131,7 @@ def rt_sum(*collections):
 	
 	iterators = [iter(_v) if not hasattr(_v, '__next__') else _v for _v in collections]
 	active = [True for _n in range(len(iterators))]
+	errors = []
 	
 	while any(active):
 		for n, iterator in enumerate(iterators):
@@ -130,14 +141,21 @@ def rt_sum(*collections):
 				yield next(iterator)
 			except StopIteration:
 				active[n] = False
+			except Exception as error:
+				errors.append(error)
+				active[n] = False
+	
+	if errors:
+		raise ExceptionGroup("Errors in `rt_sum`.", errors)
 
 
 def rt_product(*collections):
 	"Pull data from all the iterables and yield tuples of all combinations."
-		
+	
 	iterators = [iter(_v) if not hasattr(_v, '__next__') else _v for _v in collections]
 	values = [[] for _n in range(len(iterators))]
 	active = [True for _n in range(len(iterators))]
+	errors = []
 	
 	while any(active):
 		for n, iterator in enumerate(iterators):
@@ -147,16 +165,20 @@ def rt_product(*collections):
 				value = next(iterator)
 			except StopIteration:
 				active[n] = False
-				if not values[n]:
-					for m, iterator in enumerate(iterators):
-						if active[m]:
-							try:
-								iterator.kill()
-							except AttributeError:
-								pass
-					return
+			except Exception as error:
+				errors.append(error)
+				active[n] = False
 			else:
 				values[n].append(value)
+			
+			#if not values[n]:
+			#	for m, iterator in enumerate(iterators):
+			#		if active[m]:
+			#			try:
+			#				iterator.kill()
+			#			except AttributeError:
+			#				pass
+			#	return
 		
 		for selection in product(*[[True, False] if a else [False] for a in active]):
 			if not any(selection): continue
@@ -171,6 +193,9 @@ def rt_product(*collections):
 					round_values.append(value)
 			
 			yield from product(*round_values)
+	
+	if errors:
+		raise ExceptionGroup("Errors in `rt_product`.", errors)
 
 
 if __debug__ and __name__ == '__main__':

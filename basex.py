@@ -36,6 +36,21 @@ __all__ = 'BaseXError', 'BaseXAuthError', 'BaseXQueryError', 'BaseXCommandError'
 import socket
 from collections import deque
 from hashlib import md5
+from multiprocessing import Lock
+from inspect import isgeneratorfunction
+
+
+def locked(old_method):
+	if isgeneratorfunction(old_method):
+		def new_method(self, *args, **kwargs):
+			with self.lock:
+				yield from old_method(self, *args, **kwargs)
+	else:
+		def new_method(self, *args, **kwargs):
+			with self.lock:
+				return old_method(self, *args, **kwargs)
+	new_method.__name__ = old_method.__name__
+	return new_method
 
 
 class BaseXError(Exception):
@@ -100,7 +115,7 @@ class Session:
 					try:
 						pos += s.index(ch)
 						return pos
-					except IndexError:
+					except ValueError:
 						pos += len(s)
 				else:
 					raise IndexError
@@ -192,11 +207,13 @@ class Session:
 		"Open network connection to the server."
 		self.__swrapper = self.SocketWrapper(self.address, self.family, self.tls_context)
 		self.__swrapper.open()
+		self.lock = Lock()
 	
 	@staticmethod
 	def md5(s):
 		return md5(s.encode('utf-8')).hexdigest()
 	
+	@locked
 	def login(self):
 		"Log in. Must be the first method called after open."
 		try:
@@ -210,7 +227,7 @@ class Session:
 		
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError(f"Garbage left in protocol buffers.")
+			raise BaseXProtocolError(f"Garbage left in protocol buffers (login).")
 		
 		if status == 0x0:
 			return
@@ -227,6 +244,7 @@ class Session:
 		"Close network connection to the server."
 		self.__swrapper.close()
 		del self.__swrapper
+		del self.lock
 	
 	def send_byte(self, b):
 		"Buffer one byte for sending. The argument must be 0 <= b < 256."
@@ -274,6 +292,7 @@ class Session:
 			self.logout()
 		self.close()
 	
+	@locked
 	def _COMMAND(self, command):
 		"Executes a database command."
 		
@@ -285,7 +304,7 @@ class Session:
 		info = self.recv_str()
 		status = self.recv_byte()		
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_COMMAND).")
 		
 		if status == 0x0:
 			return result
@@ -294,11 +313,12 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _QUERY(self, query):
 		"Creates a new query instance and returns its id."
 		
 		log.info(f"BaseX create xquery.")
-		log.debug(f"\n{query}")
+		log.debug('\n\t'.join(query.split('\n')) + '\n')
 		self.send_byte(0x0)
 		self.send_str(query)
 		self.flush()
@@ -306,7 +326,7 @@ class Session:
 		id_ = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_QUERY).")
 		
 		if status == 0x0:
 			return id_
@@ -315,6 +335,7 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _CREATE(self, name, input_=''):
 		"Creates a new database with the specified input (may be empty)."
 		
@@ -327,7 +348,7 @@ class Session:
 		info = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_CREATE).")
 		
 		if status == 0x0:
 			return
@@ -336,6 +357,7 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _ADD(self, name, path, input_):
 		"Adds a new document to the opened database."
 		
@@ -349,7 +371,7 @@ class Session:
 		info = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_ADD).")
 		
 		if status == 0x0:
 			return
@@ -358,6 +380,7 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _PUT(self, path, input_):
 		"Puts (adds or replaces) an XML document resource in the opened database."
 		
@@ -370,7 +393,7 @@ class Session:
 		info = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_PUT).")
 		
 		if status == 0x0:
 			return
@@ -379,6 +402,7 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _PUTBINARY(self, path, input_):
 		"Puts (adds or replaces) a binary resource in the opened database. "
 		
@@ -392,7 +416,7 @@ class Session:
 		info = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_PUTBINARY).")
 		
 		if status == 0x0:
 			return
@@ -401,18 +425,19 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _CLOSE(self, id_):
 		"Closes and unregisters the query with the specified id."
 		
 		log.info(f"BaseX close xquery {id_}")
 		self.send_byte(0x2)
-		self.send_str(id_)
+		self.send_str(str(id_))
 		self.flush()
 		
 		info = self.recv_str()
 		status = self.recv_byte()
 		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
+			raise BaseXProtocolError("Garbage left in protocol buffers (_CLOSE).")
 		
 		if status == 0x0:
 			return
@@ -421,129 +446,14 @@ class Session:
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} ('{chr(status)}') instead.")
 	
+	@locked
 	def _BIND(self, id_, name, value, type_):
 		"Binds a value to a variable. The type will be ignored if the string is empty."
 		
 		log.info(f"BaseX bind xquery variable: id: {id_}, {name} := {value}, type:{type_}")
 		self.send_byte(0x3)
-		self.send_str(id_)
+		self.send_str(str(id_))
 		self.send_str(name)
-		self.send_str(value)
-		self.send_str(type_)
-		self.flush()
-		
-		info = self.recv_str()
-		status = self.recv_byte()
-		if not self.are_buffers_empty():
-			raise BaseXProtocolError("Garbage left in protocol buffers.")
-		
-		if status == 0x0:
-			return
-		elif status == 0x1:
-			raise BaseXQueryError(info, "BIND", id_, name, value, type_)
-		else:
-			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
-	
-	def _RESULTS(self, id_):
-		"Returns all resulting items as strings, prefixed by a single byte that represents the Type ID."
-		
-		log.info(f"BaseX iterate through xquery results {id_}")
-		self.send_byte(0x4)
-		self.send_str(id_)
-		self.flush()
-		
-		typeid = self.recv_byte()
-		while typeid != 0x0:
-			item = self.recv_str()
-			yield typeid, item
-			typeid = self.recv_byte()
-		
-		status = self.recv_byte()
-		
-		if status == 0x0:
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			return
-		elif status == 0x1:
-			info = self.recv_str()
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			raise BaseXQueryError(info, "RESULTS", id_)
-		else:
-			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
-	
-	def _EXECUTE(self, id_):
-		"Executes the query and returns the result as a single string."
-		
-		log.info(f"BaseX execute xquery {id_}")
-		self.send_byte(0x5)
-		self.send_str(id_)
-		self.flush()
-		
-		result = self.recv_str()
-		status = self.recv_byte()
-		
-		if status == 0x0:
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			return result
-		elif status == 0x1:
-			info = self.recv_str()
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			raise BaseXQueryError(info, "EXECUTE", id_)
-		else:
-			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
-	
-	def _INFO(self, id_):
-		"Returns a string with query compilation and profiling info."
-
-		self.send_byte(0x6)
-		self.send_str(id_)
-		self.flush()
-		
-		result = self.recv_str()
-		status = self.recv_byte()
-		
-		if status == 0x0:
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			return result
-		elif status == 0x1:
-			info = self.recv_str()
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			raise BaseXQueryError(info, "INFO", id_)
-		else:
-			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
-	
-	def _OPTIONS(self, id_):
-		"Returns a string with all query serialization parameters, which can e.g. be assigned to the SERIALIZER option."
-		
-		self.send_byte(0x7)
-		self.send_str(id_)
-		self.flush()
-		
-		result = self.recv_str()
-		status = self.recv_byte()
-		
-		if status == 0x0:
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			return result
-		elif status == 0x1:
-			info = self.recv_str()
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			raise BaseXQueryError(info, "OPTIONS", id_)
-		else:
-			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
-	
-	def _CONTEXT(self, id_, value, type_):
-		"Binds a value to the context. The type will be ignored if the string is empty."
-
-		self.send_bytes(0xe)
-		self.send_str(id_)
 		self.send_str(value)
 		self.send_str(type_)
 		self.flush()
@@ -556,21 +466,49 @@ class Session:
 		
 		if status == 0x0:
 			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			return result
+				raise BaseXProtocolError("Garbage left in protocol buffers (_BIND).")
 		elif status == 0x1:
 			info = self.recv_str()
-			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
-			raise BaseXQueryError(info, "CONTEXT", id_, value, type_)
+			raise BaseXQueryError(info, "BIND", id_, name, value, type_)
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
-	def _UPDATING(self, id_):
-		"Returns true if the query contains updating expressions; false otherwise."
+	@locked
+	def _RESULTS(self, id_):
+		"Returns all resulting items as strings, prefixed by a single byte that represents the Type ID."
 		
-		self.send_byte(0x1e)
-		self.send_str(id_)
+		log.info(f"BaseX iterate through xquery results {id_}")
+		self.send_byte(0x4)
+		self.send_str(str(id_))
+		self.flush()
+		
+		typeid = self.recv_byte()
+		while typeid != 0x0:
+			item = self.recv_str()
+			yield typeid, item
+			typeid = self.recv_byte()
+		
+		status = self.recv_byte()
+		
+		if status == 0x0:
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_RESULTS, no error).")
+			return
+		elif status == 0x1:
+			info = self.recv_str()
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_RESULTS, error).")
+			raise BaseXQueryError(info, "RESULTS", id_)
+		else:
+			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
+	
+	@locked
+	def _EXECUTE(self, id_):
+		"Executes the query and returns the result as a single string."
+		
+		log.info(f"BaseX execute xquery {id_}")
+		self.send_byte(0x5)
+		self.send_str(str(id_))
 		self.flush()
 		
 		result = self.recv_str()
@@ -578,21 +516,119 @@ class Session:
 		
 		if status == 0x0:
 			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
+				raise BaseXProtocolError("Garbage left in protocol buffers (_EXECUTE, no error).")
 			return result
 		elif status == 0x1:
 			info = self.recv_str()
 			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
+				raise BaseXProtocolError("Garbage left in protocol buffers (_EXECUTE, error).")
+			raise BaseXQueryError(info, "EXECUTE", id_)
+		else:
+			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
+	
+	@locked
+	def _INFO(self, id_):
+		"Returns a string with query compilation and profiling info."
+
+		self.send_byte(0x6)
+		self.send_str(str(id_))
+		self.flush()
+		
+		result = self.recv_str()
+		status = self.recv_byte()
+		
+		if status == 0x0:
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_INFO, no error).")
+			return result
+		elif status == 0x1:
+			info = self.recv_str()
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_INFO, error).")
+			raise BaseXQueryError(info, "INFO", id_)
+		else:
+			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
+	
+	@locked
+	def _OPTIONS(self, id_):
+		"Returns a string with all query serialization parameters, which can e.g. be assigned to the SERIALIZER option."
+		
+		self.send_byte(0x7)
+		self.send_str(str(id_))
+		self.flush()
+		
+		result = self.recv_str()
+		status = self.recv_byte()
+		
+		if status == 0x0:
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_OPTIONS, no error).")
+			return result
+		elif status == 0x1:
+			info = self.recv_str()
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_OPTIONS, error).")
+			raise BaseXQueryError(info, "OPTIONS", id_)
+		else:
+			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
+	
+	@locked
+	def _CONTEXT(self, id_, value, type_):
+		"Binds a value to the context. The type will be ignored if the string is empty."
+
+		self.send_bytes(0xe)
+		self.send_str(str(id_))
+		self.send_str(value)
+		self.send_str(type_)
+		self.flush()
+		
+		zero = self.recv_byte()
+		if zero != 0x0:
+			raise BaseXProtocolError(f"Expected zero byte, got {hex(zero)} instead.")
+		
+		status = self.recv_byte()
+		
+		if status == 0x0:
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_CONTEXT, no error).")
+			return
+		elif status == 0x1:
+			info = self.recv_str()
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_CONTEXT, error).")
+			raise BaseXQueryError(info, "CONTEXT", id_, value, type_)
+		else:
+			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
+	
+	@locked
+	def _UPDATING(self, id_):
+		"Returns true if the query contains updating expressions; false otherwise."
+		
+		self.send_byte(0x1e)
+		self.send_str(str(id_))
+		self.flush()
+		
+		result = self.recv_str()
+		status = self.recv_byte()
+		
+		if status == 0x0:
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_UPDATING, no error).")
+			return result
+		elif status == 0x1:
+			info = self.recv_str()
+			if not self.are_buffers_empty():
+				raise BaseXProtocolError("Garbage left in protocol buffers (_UPDATING, error).")
 			raise BaseXQueryError(info, "UPDATING", id_)
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
 	
+	@locked
 	def _FULL(self, id_):
 		"Returns all resulting items as strings, prefixed by the XDM Metadata."
 		
 		self.send_byte(0x1f)
-		self.send_str(id_)
+		self.send_str(str(id_))
 		self.flush()
 		
 		typeid = self.recv_byte()
@@ -609,12 +645,12 @@ class Session:
 		
 		if status == 0x0:
 			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
+				raise BaseXProtocolError("Garbage left in protocol buffers (_FULL, no error).")
 			return
 		elif status == 0x1:
 			info = self.recv_str()
 			if not self.are_buffers_empty():
-				raise BaseXProtocolError("Garbage left in protocol buffers.")
+				raise BaseXProtocolError("Garbage left in protocol buffers (_FULL, error).")
 			raise BaseXQueryError(info, "FULL", id_)
 		else:
 			raise BaseXProtocolError(f"Expected status byte 0 or 1, got {hex(status)} instead.")
@@ -731,7 +767,8 @@ class Query:
 		"Sends the query and creates the underlying resources on the server. Must be called before any data method. Returns the query id created by the server."
 		if hasattr(self, 'id_'):
 			raise ValueError("Query already active.")
-		self.id_ = self.session._QUERY(self.query)
+		self.id_ = int(self.session._QUERY(self.query))
+		log.info(f"Opened xquery id {self.id_}")
 		return self.id_
 	
 	def close(self):

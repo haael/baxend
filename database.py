@@ -6,7 +6,7 @@ from logging import getLogger, basicConfig, DEBUG, INFO, WARNING, ERROR
 log = getLogger(__name__)
 
 if __name__ == '__main__':
-	basicConfig(level=WARNING, format='%(asctime)-8s %(levelname)-8s %(name)-32s %(message)s')
+	basicConfig(level=DEBUG, format='%(asctime)-8s %(levelname)-8s %(name)-32s %(message)s')
 	
 	import warnings
 	warnings.filterwarnings('ignore')
@@ -22,9 +22,11 @@ from enum import Enum
 if __name__ == '__main__':
 	from basex import Session as BaseXSession, BaseXQueryError
 	from locking import locked_ro, locked_rw, MultiLock, Driver, Accessor
+	from xmltype import XMLType, XMLText, XMLAttribute
 else:
 	from .basex import Session as BaseXSession, BaseXQueryError
 	from .locking import locked_ro, locked_rw, MultiLock, Driver, Accessor
+	from .xmltype import XMLType, XMLText, XMLAttribute
 
 
 class Database(BaseXSession, Driver):
@@ -51,11 +53,16 @@ class Database(BaseXSession, Driver):
 					query.close()
 				super().__delitem__(query_str)
 	
-	def __init__(self, arbitrator, host, port, user, password, database_name, xmlns={}):
+	def __init__(self, arbitrator, host, port, user, password, database_name, xmlns={}, xml_pfx={}):
 		Driver.__init__(self, arbitrator)
 		BaseXSession.__init__(self, user, password, (host, port))
 		self.database_name = database_name
-		self.xmlns = {}
+		self.xmlns = dict(xmlns)
+		self.xml_pfx = dict(xml_pfx)
+		try:
+			del self.xmlns['xml']
+		except KeyError:
+			pass
 	
 	def __enter__(self):
 		super().__enter__()
@@ -72,7 +79,12 @@ class Database(BaseXSession, Driver):
 		super().__exit__(*args)
 	
 	def keys(self):
-		return [_line.split(' ')[0] for _line in self.execute.dir_().split('\n')[2:-3]]
+		path_lines = self.execute.list_(self.database_name).split('\n')[:-3]
+		lim = path_lines[0].index('Type')
+		result = []
+		for line in path_lines[2:]:
+			result.append(line[:lim].rstrip())
+		return result
 	
 	def values(self):
 		for path in self.keys():
@@ -100,31 +112,72 @@ class Database(BaseXSession, Driver):
 		except BaseXCommandError:
 			raise KeyError(path)
 	
-	def doc(self, document, xmlns={}):
+	def doc(self, document, xmlns={}, xml_pfx={}):
 		table_xmlns = {}
 		table_xmlns.update(self.xmlns)
 		table_xmlns.update(xmlns)
-		return Table(self, document, (), (), table_xmlns)
+		
+		table_xml_pfx = {}
+		table_xml_pfx.update(self.xml_pfx)
+		table_xml_pfx.update(xml_pfx)
+		
+		return Table(self, document, (), (), {}, table_xmlns, table_xml_pfx)
+	
+	@staticmethod
+	def xml_convert(py_value, xml_pfx):
+		if isinstance(py_value, bool):
+			return ('true' if py_value else 'false'), 'xs:boolean'
+		elif isinstance(py_value, int):
+			return str(py_value), 'xs:int'
+		elif isinstance(py_value, float):
+			return str(py_value), 'xs:double'
+		elif isinstance(py_value, str):
+			return py_value, 'xs:string'
+		elif isinstance(py_value, XMLType):
+			return py_value.render(xml_pfx=xml_pfx), 'element()'
+		elif isinstance(py_value, XMLText):
+			return str(py_value), 'text()'
+		else:
+			raise TypeError(f"Can't convert Python value {repr(py_value)} of type {type(py_value).__name__} to XML type.")
+	
+	@staticmethod
+	def py_convert(type_name, xml_value):
+		if type_name in ['xs:integer', 'xs:long', 'xs:int', 'xs:short', 'xs:byte', 'xs:nonNegativeInteger', 'xs:unsignedLong', 'xs:unsignedInt', 'xs:unsignedShort', 'xs:unsignedByte', 'xs:positiveInteger']:
+			return int(xml_value)
+		elif type_name in ['xs:float', 'xs:double', 'xs:decimal', 'xs:precisionDecimal']:
+			return float(xml_value)
+		elif type_name == 'xs:string':
+			return xml_value
+		elif type_name == 'element()' or type_name == 'document-node(element())':
+			return XMLType(xml_value, None)
+		elif type_name == 'text()':
+			return XMLText(xml_value)
+		elif type_name == 'xs:boolean':
+			return True if (xml_value in ['true', '1']) else False
+		else:
+			raise TypeError(f"Can't convert XML type {type_name} to Python type.")
 
 
 class Table(Accessor):
-	def __init__(self, database, document, expression_chain, selector_chain, xmlns):
+	def __init__(self, database, document, expression_chain, selector_chain, bound_variables, xmlns, xml_pfx):
 		super().__init__(database, document, isinstance(document, frozenset))
 		self.database = database
 		self.document = document
 		self.expression_chain = expression_chain
 		self.selector_chain = selector_chain
+		self.bound_variables = bound_variables
 		self.xmlns = xmlns
+		self.xml_pfx = xml_pfx
 		self.__query_string_cache = {}
 	
 	def __truediv__(self, path_element):
 		"Expression building helper. Extend the path by one element."
 		expr_chain = self.expression_chain
 		if not expr_chain or expr_chain[-1][1] != None:
-			expr_chain = expr_chain + ((path_element, None, None),)
+			expr_chain = expr_chain + (((path_element,), None, None),)
 		else:
-			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0] + '/' + path_element, None, None),)
-		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.xmlns)
+			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0] + (path_element,), None, None),)
+		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.bound_variables, self.xmlns, self.xml_pfx)
 	
 	def __matmul__(self, keys_spec):
 		"Expression building helper. Provide keys specification."
@@ -132,8 +185,15 @@ class Table(Accessor):
 		if not expr_chain or expr_chain[-1][1] != None:
 			raise ValueError("Provide a path element before specifying keys.")
 		else:
+			if not keys_spec:
+				keys_spec = [None]
 			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0], tuple(keys_spec), expr_chain[-1][2]),)
-		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.xmlns)
+		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.bound_variables, self.xmlns, self.xml_pfx)
+	
+	def __floordiv__(self, values):
+		bound_variables = dict(self.bound_variables)
+		bound_variables.update(values)
+		return self.__class__(self.database, self.document, self.expression_chain, self.selector_chain, bound_variables, self.xmlns, self.xml_pfx)
 	
 	def __mod__(self, filter_spec):
 		"Expression building helper. Apply a filter on the results."
@@ -141,10 +201,10 @@ class Table(Accessor):
 		if not expr_chain or expr_chain[-1][1] != None:
 			raise ValueError("Provide path element first.")
 		elif expr_chain[-1][2] == None:
-			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0], expr_chain[-1][1], filter_spec),)
+			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0], expr_chain[-1][1], (filter_spec,)),)
 		else:
-			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0], expr_chain[-1][1], f'{expr_chain[-1][2]} and ({filter_spec})'),)
-		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.xmlns)
+			expr_chain = expr_chain[:-1] + ((expr_chain[-1][0], expr_chain[-1][1], expr_chain[-1][2] + (filter_spec,)),)
+		return self.__class__(self.database, self.document, expr_chain, self.selector_chain, self.bound_variables, self.xmlns, self.xml_pfx)
 	
 	def __mul__(self, other):
 		"Expression building helper. Create cartesian product of the expressions."
@@ -152,8 +212,8 @@ class Table(Accessor):
 		if self.database is not other.database:
 			raise ValueError
 		
-		self_is_product = self.expression_chain and isinstance(self.expression_chain[-1][0], tuple) and self.expression_chain[-1][1] == None and self.expression_chain[-1][2] == None
-		other_is_product = other.expression_chain and isinstance(other.expression_chain[-1][0], tuple) and other.expression_chain[-1][1] == None and other.expression_chain[-1][2] == None
+		self_is_product = self.expression_chain and self.expression_chain[-1][1] == None and self.expression_chain[-1][2] == None and all(isinstance(_subpath, Table) for _subpath in self.expression_chain[-1][0])
+		other_is_product = other.expression_chain and other.expression_chain[-1][1] == None and other.expression_chain[-1][2] == None and all(isinstance(_subpath, Table) for _subpath in other.expression_chain[-1][0])
 		
 		if not self_is_product and not other_is_product:
 			expr_chain = (((self[...], other[...]), None, None),)
@@ -176,7 +236,10 @@ class Table(Accessor):
 		elif isinstance(self.document, frozenset) and isinstance(other.document, frozenset):
 			documents = self.document | other.document
 		
-		return self.__class__(self.database, documents, expr_chain, (), self.xmlns)
+		bound_variables = dict()
+		bound_variables.update(self.bound_variables)
+		bound_variables.update(other.bound_variables)
+		return self.__class__(self.database, documents, expr_chain, (), bound_variables, self.xmlns, self.xml_pfx)
 	
 	def __xmlns_decls(self):
 		for prefix, namespace in self.xmlns.items():
@@ -198,9 +261,17 @@ class Table(Accessor):
 					if val.stop != None:
 						yield f'declare variable $key{level}_{m}_{n}_high external;'
 		
-		if self.expression_chain and isinstance(self.expression_chain[0][0], tuple):
+		if self.expression_chain and all(isinstance(_subpath, Table) for _subpath in self.expression_chain[0][0]):
 			for k, subpath in enumerate(self.expression_chain[0][0]):
 				yield from subpath.__var_decls(level=self.__digits[k] + level)
+	
+	def __bound_var_decls(self):
+		for varname in self.bound_variables.keys():
+			yield f'declare variable ${varname} external;'
+	
+	def __apply_bound_variables(self, query):
+		for varname, value in self.bound_variables.items():
+			query.bind('$' + varname, *self.database.xml_convert(value, self.xml_pfx))
 	
 	__numerals = 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'
 	__digits = '1234567890'
@@ -209,17 +280,26 @@ class Table(Accessor):
 		p = f'doc("{self.database.database_name}/{self.document}")'
 		s = ''
 		l = 0
-		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain)):
+		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain)):			
 			if isinstance(vals, tuple):
 				keyspecs = []
 				for n, (key, val) in enumerate(zip(keys, vals)):
 					if not isinstance(val, slice):
-						keyspecs.append(f'{key}=$key{level}_{m}_{n}')
+						if key != None:
+							keyspecs.append(f'{key}=$key{level}_{m}_{n}')
+						else:
+							keyspecs.append(f'$key{level}_{m}_{n}')
 					else:
-						if val.start != None:
-							keyspecs.append(f'{key}>=$key{level}_{m}_{n}_low')
-						if val.stop != None:
-							keyspecs.append(f'{key}<$key{level}_{m}_{n}_high')
+						if key != None:
+							if val.start != None:
+								keyspecs.append(f'{key}>=$key{level}_{m}_{n}_low')
+							if val.stop != None:
+								keyspecs.append(f'{key}<$key{level}_{m}_{n}_high')
+						else:
+							if val.start != None:
+								keyspecs.append(f'position()>=$key{level}_{m}_{n}_low')
+							if val.stop != None:
+								keyspecs.append(f'position()<$key{level}_{m}_{n}_high')
 				
 				keyspec = '[' + ' and '.join(keyspecs) +']'
 			elif vals == Ellipsis:
@@ -227,7 +307,9 @@ class Table(Accessor):
 			else:
 				raise RuntimeError
 			
-			if isinstance(path, tuple):
+			filter_ = ' and '.join([f'({_filter_spec})' for _filter_spec in filter_]) if filter_ != None else ''
+			
+			if all(isinstance(_subpath, Table) for _subpath in path):
 				assert m == 0
 				assert len(path) <= 10
 				
@@ -247,8 +329,10 @@ class Table(Accessor):
 				s = ''.join(sp)
 				p = f'$this{keyspec}'
 			elif not filter_:
+				path = '/'.join(path)
 				p = f'{p}/{path}{keyspec}'
 			else:
+				path = '/'.join(path)
 				s = f'{s}{" "*l}for $this in {p}/{path}\n{" "*l} where {filter_}\n'
 				p = f'$this{keyspec}'
 				l += 1
@@ -261,7 +345,7 @@ class Table(Accessor):
 		else:
 			return p
 	
-	__Mode = Enum('Table._Table__Mode', 'GET COUNT INSERT DELETE KEYS')
+	__Mode = Enum('Table._Table__Mode', 'GET COUNT INSERT DELETE KEYS GETATTR SETATTR')
 	
 	def __query_string(self, mode):
 		try:
@@ -271,6 +355,11 @@ class Table(Accessor):
 		
 		if mode == self.__Mode.GET:
 			modifier = None
+		elif mode == self.__Mode.GETATTR:
+			modifier = lambda p: f'( let $element := {p} return if(empty($element)) then () else element {{fn:node-name($element)}} {{$element/@*}} )'
+		elif mode == self.__Mode.SETATTR:
+			#raise NotImplementedError
+			modifier = lambda p: f'( let $element := {p} return if(empty($element)) then () else replace node $element with element {{fn:node-name($inserted)}} {{ $inserted/@*, $element/* }} )'
 		elif mode == self.__Mode.COUNT:
 			modifier = lambda p: f'count({p})'
 		elif mode == self.__Mode.KEYS:
@@ -279,11 +368,13 @@ class Table(Accessor):
 		elif mode == self.__Mode.DELETE:
 			modifier = lambda p: f'{p}/(delete node ., update:output("deleted"))'
 		elif mode == self.__Mode.INSERT:
-			modifier = lambda p: f'insert node $inserted into {p}'
+			path_stem = '/'.join(self.expression_chain[len(self.selector_chain)][0][:-1])
+			if path_stem: path_stem = '/' + path_stem
+			modifier = lambda p: f'insert node $inserted into {p}{path_stem}'
 		else:
 			raise NotImplementedError(f"Unsupported mode: {mode}.")
 		
-		result = '\n'.join(chain(self.__xmlns_decls(), self.__var_decls(), (['declare variable $inserted external;'] if mode == self.__Mode.INSERT else []) + [self.__query_expr(modifier)]))
+		result = '\n'.join(chain(self.__xmlns_decls(), self.__var_decls(), self.__bound_var_decls(), (['declare variable $inserted external;'] if mode in (self.__Mode.INSERT, self.__Mode.SETATTR) else []) + [self.__query_expr(modifier)]))
 		self.__query_string_cache[mode] = result
 		return result
 	
@@ -292,23 +383,23 @@ class Table(Accessor):
 			if isinstance(vals, tuple):
 				for n, (key, val) in enumerate(zip(keys, vals)):
 					if not isinstance(val, slice):
-						query.bind(f'$key{level}_{m}_{n}', val, 'xs:string')
+						query.bind(f'$key{level}_{m}_{n}', *self.database.xml_convert(val, self.xml_pfx))
 					else:
 						if val.start != None:
-							query.bind(f'$key{level}_{m}_{n}_low', val.start, 'xs:string')
+							query.bind(f'$key{level}_{m}_{n}_low', *self.database.xml_convert(val.start, self.xml_pfx))
 						if val.stop != None:
-							query.bind(f'$key{level}_{m}_{n}_high', val.stop, 'xs:string')
+							query.bind(f'$key{level}_{m}_{n}_high', *self.database.xml_convert(val.stop, self.xml_pfx))
 			elif vals == Ellipsis:
 				pass
 			else:
 				raise RuntimeError
 		
-		if self.expression_chain and isinstance(self.expression_chain[0][0], tuple):
+		if self.expression_chain and all(isinstance(_subpath, Table) for _subpath in self.expression_chain[0][0]):
 			for k, subpath in enumerate(self.expression_chain[0][0]):
 				subpath.__apply_keys(query, level=self.__digits[k] + level)
 	
-	def __apply_value(self, query, value):
-		query.bind('$inserted', value, 'element()')
+	def __apply_value(self, query, py_value):
+		query.bind('$inserted', *self.database.xml_convert(py_value, self.xml_pfx))
 	
 	def __is_slice(self):
 		for m, ((path, keys, filter_), vals) in enumerate(zip(self.expression_chain, self.selector_chain)):
@@ -321,7 +412,7 @@ class Table(Accessor):
 			else:
 				raise RuntimeError
 		
-		if self.expression_chain and isinstance(self.expression_chain[0][0], tuple):
+		if self.expression_chain and all(isinstance(_subpath, Table) for _subpath in self.expression_chain[0][0]):
 			for subpath in self.expression_chain[0][0]:
 				if subpath.__is_slice():
 					return True
@@ -341,32 +432,123 @@ class Table(Accessor):
 			raise TypeError("End of chain reached.")
 		
 		sel_chain = self.selector_chain + (keys_values,)
-		return self.__class__(self.database, self.document, self.expression_chain, sel_chain, self.xmlns)
+		return self.__class__(self.database, self.document, self.expression_chain, sel_chain, self.bound_variables, self.xmlns, self.xml_pfx)
 	
 	@locked_ro
 	def __str__(self):
 		query_str = self.__query_string(self.__Mode.GET)
 		query = self.database.queries[query_str]
 		self.__apply_keys(query)
+		self.__apply_bound_variables(query)
 		result = query.execute()
 		if not result and not self.__is_slice():
 			raise KeyError("Query returned no result.")
 		return result
 	
 	@locked_ro
+	def get_tags(self):
+		query_str = self.__query_string(self.__Mode.GETATTR)
+		query = self.database.queries[query_str]
+		self.__apply_keys(query)
+		self.__apply_bound_variables(query)
+		for typeid, item in query.results():
+			yield self.database.py_convert(typeid, item)
+	
+	@property
+	def tag(self):
+		if self.__is_slice():
+			raise ValueError("The query must refer to 1 element.")
+		
+		over = self.get_tags()
+		finished = False
+		try:		
+			try:
+				result = next(over)
+			except StopIteration:
+				finished = True
+				raise KeyError("Empty result (tag).")
+			
+			try:
+				next(over)
+			except StopIteration:
+				finished = True
+			else:
+				raise ValueError("Result has more than 1 element (tag).")
+			
+			return result
+		finally:
+			if not finished:
+				while True:
+					try:
+						next(over)
+					except StopIteration:
+						break
+	
+	@locked_rw
+	def set_tags(self, value):
+		query_str = self.__query_string(self.__Mode.SETATTR)
+		query = self.database.queries[query_str]
+		self.__apply_keys(query)
+		self.__apply_bound_variables(query)
+		self.__apply_value(query, value)
+		query.execute()
+	
+	@tag.setter
+	def tag(self, value):
+		if self.__is_slice():
+			raise ValueError("The query must refer to 1 element.")		
+		self.set_tags(value)
+	
+	@locked_ro
 	def __iter__(self):
 		query_str = self.__query_string(self.__Mode.GET)		
 		query = self.database.queries[query_str]
 		self.__apply_keys(query)
+		self.__apply_bound_variables(query)
 		for typeid, item in query.results():
-			yield item
+			yield self.database.py_convert(typeid, item)
+	
+	def __call__(self):
+		over = iter(self)
+		finished = False
+		try:
+			try:
+				result = next(over)
+			except StopIteration:
+				finished = True
+				raise KeyError("Empty result (call).")
+			
+			try:
+				next(over)
+			except StopIteration:
+				finished = True
+			else:
+				raise ValueError("Result has more than 1 element (call).")
+			
+			return result
+		finally:
+			if not finished:
+				while True:
+					try:
+						next(over)
+					except StopIteration:
+						break
 	
 	@locked_ro
 	def __len__(self):
-		query_str = self.__query_string(self.__Mode.COUNT)
-		query = self.database.queries[query_str]
-		self.__apply_keys(query)
-		return sum(int(_l) for _l in query.execute().split('\n'))
+		if self.__is_slice():
+			query_str = self.__query_string(self.__Mode.COUNT)
+			query = self.database.queries[query_str]
+			self.__apply_keys(query)
+			self.__apply_bound_variables(query)
+			return sum(int(_l) for _l in query.execute().split('\n') if _l)
+		else:
+			final = self[...]
+			query_str = final.__query_string(self.__Mode.COUNT)
+			query = final.database.queries[query_str]
+			final.__apply_keys(query)
+			final.__apply_bound_variables(query)
+			return sum(int(_l) for _l in query.execute().split('\n') if _l)
 	
 	@locked_ro
 	def __contains__(self, keys_values):
@@ -374,7 +556,8 @@ class Table(Accessor):
 		query_str = final.__query_string(self.__Mode.COUNT)
 		query = final.database.queries[query_str]
 		final.__apply_keys(query)
-		return bool(sum(int(_l) for _l in query.execute().split('\n')))
+		final.__apply_bound_variables(query)
+		return bool(sum(int(_l) for _l in query.execute().split('\n') if _l))
 	
 	@locked_ro
 	def keys(self):
@@ -384,10 +567,9 @@ class Table(Accessor):
 		query_str = final.__query_string(self.__Mode.KEYS)
 		query = final.database.queries[query_str]
 		final.__apply_keys(query)
+		final.__apply_bound_variables(query)
 		for typeid, item in query.results():
-			if typeid == 'attribute()':
-				item = item.split('=')[1][1:-1]
-			r.append(item)
+			r.append(self.database.py_convert(typeid, item))
 			if len(r) == l:
 				if l == 1:
 					yield r[0]
@@ -413,17 +595,20 @@ class Table(Accessor):
 		query_str = final.__query_string(self.__Mode.DELETE)
 		query = final.database.queries[query_str]
 		final.__apply_keys(query)
+		final.__apply_bound_variables(query)
 		query.execute()
 		
 		query_str = self.__query_string(self.__Mode.INSERT)
 		query = self.database.queries[query_str]
-		if self.__is_slice():
+		if final.__is_slice():
 			for value in values:
 				self.__apply_keys(query)
+				self.__apply_bound_variables(query)
 				self.__apply_value(query, value)
 				query.execute()
 		else:
 			self.__apply_keys(query)
+			self.__apply_bound_variables(query)
 			self.__apply_value(query, values)
 			query.execute()
 	
@@ -433,9 +618,16 @@ class Table(Accessor):
 		query_str = final.__query_string(self.__Mode.DELETE)
 		query = final.database.queries[query_str]
 		final.__apply_keys(query)
+		final.__apply_bound_variables(query)
 		result = query.execute() # TODO: check result
 		if not result and not self.__is_slice():
 			raise KeyError("Query returned no result.")
+	
+	def get_attr(self, attr, type_):
+		raise NotImplementedError(f"get_attr({attr}, {type_})")
+	
+	def set_attr(self, attr, value):
+		raise NotImplementedError(f"set_attr({attr}, {value})")
 
 
 if __debug__ and __name__ == '__main__':
@@ -451,11 +643,17 @@ if __debug__ and __name__ == '__main__':
 	arbitrator = Arbitrator(Manager())
 	arbitrator.prepare_namespace()
 	
+	XMLType.xmlns['baxend'] = 'https://github.com/haael/baxend'
+	XMLType.xml_pfx['https://github.com/haael/baxend'] = ''
+	XMLType.xml_pfx['other'] = 'other'
+	
 	database = Database(arbitrator, '::1', 1984, 'db_user', 'wemn2o03289', 'baxend_test')
 	database.xmlns['baxend'] = 'https://github.com/haael/baxend'
-	table1 = database.doc('one.xml') / 'baxend:root' / 'baxend:one' % 'string-length($this/baxend:descr/text()) < 15' @ ['baxend:title/text()'] / 'baxend:two' % '$this/@x < $this/@y' @ ['@x', '@y']
-	table2 = database.doc('two.xml') / 'baxend:root' / 'baxend:one' % 'string-length($this/baxend:descr/text()) < 20' @ ['baxend:title/text()'] / 'baxend:two' @ ['@y', '@z']
-	table3 = table1[...] * table2["Fifth"] % '$one/@y = $two/@y' @ ['baxend:two[1]/@x', 'baxend:two[2]/@z']
+	database.xml_pfx['https://github.com/haael/baxend'] = ''
+	
+	table1 = database.doc('one.xml') / 'baxend:root' / 'baxend:one' % 'string-length($this/baxend:descr/text()) < 15' @ ['baxend:title/text()'] / 'baxend:two' % 'xs:int($this/@x) < xs:int($this/@y)' @ ['xs:int(@x)', 'xs:int(@y)']
+	table2 = database.doc('two.xml') / 'baxend:root' / 'baxend:one' % 'string-length($this/baxend:descr/text()) < 20' @ ['baxend:title/text()'] / 'baxend:two' @ ['xs:int(@y)', 'xs:int(@z)']
+	table3 = table1[...] * table2["Fifth"] % 'xs:int($one/@y) = xs:int($two/@y)' @ ['xs:int(baxend:two[1]/@x)', 'xs:int(baxend:two[2]/@z)']
 	
 	#profiler = PyCallGraph(output=GraphvizOutput(output_file='database.png'))
 	#profiler.start()
@@ -471,7 +669,7 @@ if __debug__ and __name__ == '__main__':
 					<two x="2" y="2">C</two><!-- invisible -->
 					<two x="2" y="3">D</two>
 				</one>
-				<one>
+				<one k="kkk" l="lll">
 					<title>Second</title>
 					<descr>Second entry</descr>
 					<two x="10" y="20">E</two>
@@ -514,16 +712,16 @@ if __debug__ and __name__ == '__main__':
 				</one>
 			</root>
 		'''
-		
-		perf_iters = 1000
+
+		perf_iters = 1
 		
 		try:
 			print()
 			print(1)
 			print("table1.keys():", list(table1.keys()))
 			print("table1[\"First\"].keys():", list(table1["First"].keys()))
-			print(table1["First"]['1', '2'])
-			print("len:", len(table1["First"]))
+			print(table1["First"][1, 2])
+			print("len:", len(table1), len(table1["First"]), len(table1["First":"ZZZ"]))
 			for value in table1["First"][...]:
 				print(" ", value)
 			
@@ -582,8 +780,25 @@ if __debug__ and __name__ == '__main__':
 			print(database['one.xml'])
 			print()
 			
-			print('del table1["Second"][10,30]')
-			del table1["Second"][10,30]
+			print('table1["Second"].tag')
+			second_tag = table1["Second"].tag
+			print(second_tag)
+			print()
+			
+			second_tag['@k'] = "ooo"
+			print('table1["Second"].tag = ...')
+			table1["Second"].tag = second_tag
+			print(second_tag)
+			print()
+			
+			print(database['one.xml'])
+			
+			print('table1["Second"].tag')
+			print(table1["Second"].tag)
+			print()
+			
+			print('del table1["Second"][10,3 0]')
+			del table1["Second"][10, 30]
 			print(database['one.xml'])
 			print()
 			
@@ -597,13 +812,12 @@ if __debug__ and __name__ == '__main__':
 			print(database['one.xml'])
 			print()
 			
-			print('table1["First"][\'11\', \'31\'] = \'<two x="11" y="31">newly</two>\'')
-			table1["First"]['11', '31'] = '<two x="11" y="31">newly</two>'
+			print('table1["First"][11, 31] = \'<two xmlns="https://github.com/haael/baxend" x="11" y="31">newly</two>\'')
+			table1["First"][11, 31] = XMLType(xml='<two xmlns="https://github.com/haael/baxend" x="11" y="31">newly</two>', default_tag=None)
 			print(database['one.xml'])
 			print()
 		except BaseXQueryError as error:
 			print(error)
-		
 		
 		del database['one.xml']
 		del database['two.xml']

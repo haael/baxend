@@ -12,17 +12,18 @@ if __name__ == '__main__':
 	warnings.filterwarnings('ignore')
 
 
-__all__ = 'locked_ro', 'locked_rw', 'MultiLock', 'GlobalDict', 'Arbitrator', 'Driver', 'Accessor'
+__all__ = 'locked_ro', 'locked_rw', 'MultiLock', 'MultiInt', 'MultiBool', 'GlobalDict', 'Arbitrator', 'Driver', 'Accessor'
 
 
 from time import time
 from ctypes import c_int
+from inspect import isgeneratorfunction
 
 
 def locked_ro(old_method):
 	"Lock a method of Accessor for read-only operation."
 	
-	if hasattr(old_method, '__next__'):
+	if isgeneratorfunction(old_method):
 		def new_method(self, *args, **kwargs):
 			log.debug(f"locked_ro begin")
 			
@@ -74,8 +75,8 @@ def locked_ro(old_method):
 
 def locked_rw(old_method):
 	"Lock a method of Accessor for read-write operation."
-
-	if hasattr(old_method, '__next__'):
+	
+	if isgeneratorfunction(old_method):
 		def new_method(self, *args, **kwargs):
 			log.debug(f"locked_rw begin")
 			
@@ -246,6 +247,19 @@ class MultiInt:
 		for integer in self.integers:
 			integer.value += (value - sv) // si
 
+
+class MultiBool:
+	def __init__(self, *booleans):
+		self.booleans = booleans
+	
+	@property
+	def value(self):
+		return all(_boolean.value for _boolean in self.booleans)
+	
+	@value.setter
+	def value(self, value):
+		for boolean in self.booleans:
+			boolean.value = value
 
 class GlobalDict:
 	def __init__(self, backing, constructor, lock):
